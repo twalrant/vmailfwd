@@ -148,6 +148,7 @@ sub vdom_read ($;$) {
             push @lines, $_;
         } else {
             my ($rcpt,@dest) = split(':', $_);
+            push @dest, '' if $#dest > 0;
             $rcpt =~ s/[\s]*//g;
             $dest[0] =~ s/[\s]*//g;
             push @lines, sprintf("[%s]", $rcpt);
