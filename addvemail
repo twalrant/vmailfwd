@@ -23,21 +23,25 @@ sub vdom_read($;$);
 sub vdom_save($$;$$);
 sub emailparse($);
 
-## Get command line options:
+## Get command line options: 1st pass to select config file.
+Getopt::Long::Configure('pass_through');
+GetOptions ("c|conf=s"	=>	\$configfile,
+            "d|debug+"	=>	\$debug) || Usage();
+
+## Read configuration file
+read_conf($configfile);
+
+## Get command line options: 2nd pass to update config params.
+Getopt::Long::Configure('no_pass_through');
 GetOptions (
     "s|remove"	=>	\$remove,
     "r|reject"	=>	\$fail,
     "x|drop"	=>	\$blackhole,
     "f|force"	=>	\$force,
     "q|quiet"	=>	\$quiet,
-    "d|debug+"	=>	\$debug,
-    "h|help"	=>	\$help )
-    || Usage();
+    "h|help"	=>	\$help ) || Usage();
 Usage() unless $ARGV[0];
 Usage() if $help;
-
-## Read configuration file
-read_conf($configfile);
 
 ## Get recipient description:
 my ($localpart_rcpt,$domain_rcpt) = emailparse($ARGV[0]);
@@ -198,7 +202,7 @@ sub read_conf($) {
         s/[\r\n]*$//;
         my ($var,$value) = split('=');
         my $evalstr = sprintf("\$%s='%s'", $var, $value);
-        print "eval($evalstr)\n";
+        print "eval($evalstr)\n" if $debug > 2;
         eval $evalstr;
     }
     close($fh);
