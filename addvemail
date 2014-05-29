@@ -1,0 +1,213 @@
+#!/usr/bin/perl
+#
+use strict;
+use File::Basename;
+use File::Copy qw(move);
+use Getopt::Long qw(:config no_ignore_case);
+
+## Global variables:
+my $help = 0;
+my $debug = 0;
+my $remove = 0;
+my $force = 0;
+my $fail = 0;
+my $quiet = 0;
+my $blackhole = 0;
+my $domains_dir;
+my $domains_bckdir;
+my $configfile = '/etc/default/'.basename($0);
+
+## Some function prototypes:
+sub abort(@);
+sub vdom_read($;$);
+sub vdom_save($$;$$);
+sub emailparse($);
+
+## Get command line options:
+GetOptions (
+    "s|remove"	=>	\$remove,
+    "r|reject"	=>	\$fail,
+    "x|drop"	=>	\$blackhole,
+    "f|force"	=>	\$force,
+    "q|quiet"	=>	\$quiet,
+    "d|debug+"	=>	\$debug,
+    "h|help"	=>	\$help )
+    || Usage();
+Usage() unless $ARGV[0];
+Usage() if $help;
+
+## Read configuration file
+read_conf($configfile);
+
+## Get recipient description:
+my ($localpart_rcpt,$domain_rcpt) = emailparse($ARGV[0]);
+
+print "Recipient:   local-part= $localpart_rcpt, domain= $domain_rcpt\n"
+    if $debug;
+
+## Read recipient virtual domain file:
+my $vdom = vdom_read($domain_rcpt, $domains_dir);
+die "Virtual domain not found: $domain_rcpt\n" unless $vdom;
+
+## Delete entry:
+if ($remove) {
+    abort "Recipient not found: $localpart_rcpt\@$domain_rcpt\n"
+        unless $vdom->{map}->{$localpart_rcpt};
+    delete $vdom->{map}->{$localpart_rcpt};
+
+    printf("Recipient removed: %s\n",
+           join('@', $localpart_rcpt, $domain_rcpt ))
+        unless $quiet;
+}
+
+## Add entry:
+unless ($remove) {
+    my ($localpart_dest,$domain_dest) = emailparse($ARGV[1]);
+
+    print "Destination: local-part= $localpart_dest, domain= $domain_dest\n"
+        if $debug;
+
+    unless ($force) {
+        abort "Recipient already exists: $ARGV[0]" if
+            $vdom->{map}->{$localpart_rcpt};
+    }
+
+    # Skip recipient and destination arguments.
+    shift @ARGV;
+    shift @ARGV unless $fail;	# Destination is not present, rather fail text.
+
+    # Prepare destination description
+    my $dest;
+    $dest = ":blackhole:" if $blackhole;
+    if ($fail) {
+        $dest = ":fail:" if $fail;
+        $dest .= join(' ', ' ', @ARGV) if $ARGV[0];
+        $dest .= sprintf("Unknown user: %s", $localpart_rcpt) unless $ARGV[0];
+    }
+    $dest = join('@', $localpart_dest, $domain_dest) unless $dest;
+    
+    printf("Recipient added(or updated): %s\n",
+           join('@', $localpart_rcpt, $domain_rcpt ))
+           unless $quiet;
+           
+    # Add entry to the 'file' at beginning, if not already present.
+    unshift @{$vdom->{raw}}, sprintf("[%s]", $localpart_rcpt)
+        unless $vdom->{map}->{$localpart_rcpt};
+
+    # Update map entry
+    $vdom->{map}->{$localpart_rcpt} = $dest;
+}
+
+## Save modified domain: 
+vdom_save($vdom, $domain_rcpt, $domains_dir, $domains_bckdir) or
+    die "Virtual domain not saved: $domain_rcpt\n";
+
+## Dump created file, if required.
+vdom_dump($domain_rcpt, $domains_dir) if $debug > 1;
+
+## That's all folks
+exit(0);
+
+## Display formatted usage:
+sub Usage {
+    my $progname = basename($0);
+    print <<EOF
+Usage: $progname <recipient> <destination>
+EOF
+;
+    exit(0);
+}
+
+## Parse email, return local-part and domain (default to 'localhost'
+## if not presnt)
+sub emailparse ($) {
+    my $fullemail = shift;
+    my ($localpart,$domain,$dummy) = split('@', $fullemail);
+    return undef if $dummy;
+    $domain = 'localhost' unless $domain;
+    return ($localpart,$domain);
+}
+
+## Read Virtual Domain file.
+sub vdom_read ($;$) {
+    my $filename = shift;
+    my $dirname = shift;
+    $filename = join('/', $dirname, $filename) if $dirname;
+    return undef unless -f $filename;
+    my @lines;
+    my %rcpts;
+    open (my $fh, $filename) ||
+        die "Cannot open file $filename: $!\n";
+    while(<$fh>) {
+        s/[\r\n]*$//;	# Remove trailing CR-LF
+        if (/^#/ || /^;/ || /^$/) {
+            push @lines, $_;
+        } else {
+            my ($rcpt,@dest) = split(':', $_);
+            $rcpt =~ s/[\s]*//g;
+            $dest[0] =~ s/[\s]*//g;
+            push @lines, sprintf("[%s]", $rcpt);
+            $rcpts{$rcpt} = join(':', @dest);
+        }
+    }
+    close($fh);
+    return {raw => \@lines, map => \%rcpts };
+}
+
+## Save Virtual Domain to file.
+sub	vdom_save($$;$$) {
+    my $vdom = shift;
+    my $filename = shift;
+    my $dirname = shift;
+    my $dirbckp = shift;
+    $filename = join('/', $dirname, $filename) if $dirname;
+    return undef unless -f $filename;
+    move($filename, join('/', $dirbckp, join('.', $filename, 'bck')))
+         if $dirbckp;
+    open (my $fh, ">$filename") || return;
+    foreach my $line ( @{$vdom->{raw}} ) {
+        printf($fh "%s\n", $line) unless $line =~ /^\[/;
+        next unless $line =~ /^\[/;
+        my @rcpt = split('[\[\]]', $line);
+        next unless $vdom->{map}->{$rcpt[1]};
+        printf($fh "%s : %s\n", $rcpt[1], $vdom->{map}->{$rcpt[1]});
+    }
+    close($fh);
+}
+
+##
+sub	vdom_dump ($;$) {
+    my $filename = shift;
+    my $dirname = shift;
+    $filename = join('/', $dirname, $filename) if $dirname;
+    return undef unless -f $filename;
+    print "\nVirtual domain file: $filename\n";
+    open(my $fh, $filename) || return;
+    while (<$fh>) { print; }; close($fh);
+}
+
+##
+sub read_conf($) {
+    my $filename = shift;
+    return unless -f $filename;
+    open(my $fh, $filename) ||
+        die "Cannot open file $filename: $!\n";
+    while (<$fh>) {
+        next if /^#/ or /^;/ or /^$/;
+        next unless /=/;
+        s/[\r\n]*$//;
+        my ($var,$value) = split('=');
+        my $evalstr = sprintf("\$%s='%s'", $var, $value);
+        print "eval($evalstr)\n";
+        eval $evalstr;
+    }
+    close($fh);
+}
+
+## Aborting execution (kind of 'die' substitution)
+sub abort(@) {
+    print join(' ', @_);
+    exit(1);
+}
+
+## End Of File: addvemail
