@@ -15,31 +15,42 @@ my $quiet = 0;
 my $blackhole = 0;
 my $domains_dir;
 my $domains_bckdir;
-my $configfile = '/etc/default/'.basename($0);
+my $configfile = '/etc/default/vmailfwd';
 
 ## Some function prototypes:
 sub abort(@);
 sub vdom_read($;$);
-sub vdom_save($$;$$);
+sub vdom_save($;$$);
+sub vdom_delete($$);
+sub vdom_add($$$);
 sub emailparse($);
 
 ## Get command line options: 1st pass to select config file.
 Getopt::Long::Configure('pass_through');
-GetOptions ("c|conf=s"	=>	\$configfile,
-            "d|debug+"	=>	\$debug) || Usage();
+GetOptions ("c|config=s"	=>	\$configfile,
+            "d|debug+"		=>	\$debug) || Usage();
 
 ## Read configuration file
 read_conf($configfile);
 
 ## Get command line options: 2nd pass to update config params.
 Getopt::Long::Configure('no_pass_through');
-GetOptions (
-    "s|remove"	=>	\$remove,
-    "r|reject"	=>	\$fail,
-    "x|drop"	=>	\$blackhole,
-    "f|force"	=>	\$force,
-    "q|quiet"	=>	\$quiet,
-    "h|help"	=>	\$help ) || Usage();
+if ( basename($0) =~ /^del/ ) {
+    $remove = 1;
+    GetOptions (
+        "f|force"	=>	\$force,
+        "q|quiet"	=>	\$quiet,
+        "h|help"	=>	\$help ) || Usage();
+} else {
+    $remove = 0;
+    GetOptions (
+        "s|remove"	=>	\$remove,
+        "r|reject"	=>	\$fail,
+        "x|drop"	=>	\$blackhole,
+        "f|force"	=>	\$force,
+        "q|quiet"	=>	\$quiet,
+        "h|help"	=>	\$help ) || Usage();
+}
 Usage() unless $ARGV[0];
 Usage() if $help;
 
@@ -51,60 +62,17 @@ print "Recipient:   local-part= $localpart_rcpt, domain= $domain_rcpt\n"
 
 ## Read recipient virtual domain file:
 my $vdom = vdom_read($domain_rcpt, $domains_dir);
-die "Virtual domain not found: $domain_rcpt\n" unless $vdom;
+abort "Virtual domain not found: $domain_rcpt\n" unless $vdom;
 
 ## Delete entry:
-if ($remove) {
-    abort "Recipient not found: $localpart_rcpt\@$domain_rcpt\n"
-        unless $vdom->{map}->{$localpart_rcpt};
-    delete $vdom->{map}->{$localpart_rcpt};
-
-    printf("Recipient removed: %s\n",
-           join('@', $localpart_rcpt, $domain_rcpt ))
-        unless $quiet;
-}
+vdom_delete($vdom, $localpart_rcpt) if $remove;
 
 ## Add entry:
-unless ($remove) {
-    my ($localpart_dest,$domain_dest) = emailparse($ARGV[1]);
-
-    print "Destination: local-part= $localpart_dest, domain= $domain_dest\n"
-        if $debug;
-
-    unless ($force) {
-        abort "Recipient already exists: $ARGV[0]" if
-            $vdom->{map}->{$localpart_rcpt};
-    }
-
-    # Skip recipient and destination arguments.
-    shift @ARGV;
-    shift @ARGV unless $fail;	# Destination is not present, rather fail text.
-
-    # Prepare destination description
-    my $dest;
-    $dest = ":blackhole:" if $blackhole;
-    if ($fail) {
-        $dest = ":fail:" if $fail;
-        $dest .= join(' ', ' ', @ARGV) if $ARGV[0];
-        $dest .= sprintf("Unknown user: %s", $localpart_rcpt) unless $ARGV[0];
-    }
-    $dest = join('@', $localpart_dest, $domain_dest) unless $dest;
-    
-    printf("Recipient added(or updated): %s\n",
-           join('@', $localpart_rcpt, $domain_rcpt ))
-           unless $quiet;
-           
-    # Add entry to the 'file' at beginning, if not already present.
-    unshift @{$vdom->{raw}}, sprintf("[%s]", $localpart_rcpt)
-        unless $vdom->{map}->{$localpart_rcpt};
-
-    # Update map entry
-    $vdom->{map}->{$localpart_rcpt} = $dest;
-}
+vdom_add($vdom, $localpart_rcpt, $ARGV[1]) unless $remove;
 
 ## Save modified domain: 
-vdom_save($vdom, $domain_rcpt, $domains_dir, $domains_bckdir) or
-    die "Virtual domain not saved: $domain_rcpt\n";
+vdom_save($vdom, $domains_dir, $domains_bckdir) or
+    abort "Virtual domain not saved: $domain_rcpt\n";
 
 ## Dump created file, if required.
 vdom_dump($domain_rcpt, $domains_dir) if $debug > 1;
@@ -115,15 +83,32 @@ exit(0);
 ## Display formatted usage:
 sub Usage {
     my $progname = basename($0);
+    my $destarg = "{<destination>|<text> ...}";
+    $destarg = '' if $progname =~ /^del/;
     print <<EOF
-Usage: $progname <recipient> <destination>
+Usage: $progname {options} <recipient> $destarg
+Options:
+   -h, --help         Print this help.
+   -c, --config FILE  Select configuration file.
+                      (default: $configfile)
+   -q, --quiet        Disable verbose messages.
+   -d, --debug        Enable or increase debug level.
+EOF
+;
+    exit(0) if $progname =~ /^del/;
+    print <<EOF
+   -f, --force        Force operation, replace existing recipient.
+   -s, --remove       Suppress/remove existing recipient.
+   -r, --reject       Reject/bounce recipient with <text> message.
+                      (default text: Unknown user <rcpt>)
+   -x, --drop         Silently drop recipient mails.
 EOF
 ;
     exit(0);
 }
 
 ## Parse email, return local-part and domain (default to 'localhost'
-## if not presnt)
+## if not present)
 sub emailparse ($) {
     my $fullemail = shift;
     my ($localpart,$domain,$dummy) = split('@', $fullemail);
@@ -140,6 +125,7 @@ sub vdom_read ($;$) {
     return undef unless -f $filename;
     my @lines;
     my %rcpts;
+    my $pos = 0;
     open (my $fh, $filename) ||
         die "Cannot open file $filename: $!\n";
     while(<$fh>) {
@@ -153,18 +139,20 @@ sub vdom_read ($;$) {
             $dest[0] =~ s/[\s]*//g;
             push @lines, sprintf("[%s]", $rcpt);
             $rcpts{$rcpt} = join(':', @dest);
+            $pos = $#lines unless $rcpt eq '*';
         }
     }
     close($fh);
-    return {raw => \@lines, map => \%rcpts };
+    return {name => $filename, raw => \@lines,
+            map => \%rcpts, insert => 1+$pos };
 }
 
 ## Save Virtual Domain to file.
-sub	vdom_save($$;$$) {
+sub	vdom_save($;$$) {
     my $vdom = shift;
-    my $filename = shift;
     my $dirname = shift;
     my $dirbckp = shift;
+    my $filename = $vdom->{name};
     $filename = join('/', $dirname, $filename) if $dirname;
     return undef unless -f $filename;
     move($filename, join('/', $dirbckp, join('.', $filename, 'bck')))
@@ -180,7 +168,71 @@ sub	vdom_save($$;$$) {
     close($fh);
 }
 
-##
+## Add or update recipient.
+sub vdom_add ($$$) {
+    my $vdom = shift;
+    my $rcpt = shift;
+    my $dest = shift;
+
+    abort "Missing recipient" unless $dest;
+
+    my ($localpart_dest,$domain_dest) = emailparse($dest);
+
+    print "Destination: local-part= $localpart_dest, domain= $domain_dest\n"
+        if $debug;
+
+    unless ($force) {
+        abort "Recipient already exists: $rcpt\@$vdom->{name}" if
+            $vdom->{map}->{$rcpt};
+    }
+
+    # Skip recipient and destination arguments.
+    shift @ARGV;
+    shift @ARGV unless $fail;	# Destination is not present, rather fail text.
+
+    # Prepare destination description
+    $dest = undef;
+    $dest = ":blackhole:" if $blackhole;
+    if ($fail) {
+        $dest = ":fail:" if $fail;
+        $dest .= join(' ', ' ', @ARGV) if $ARGV[0];
+        $dest .= sprintf("Unknown user: %s", $localpart_rcpt) unless $ARGV[0];
+    }
+    $dest = join('@', $localpart_dest, $domain_dest) unless $dest;
+
+    printf("Recipient updated: %s\n",
+           join('@', $rcpt, $vdom->{name} ))
+        if $vdom->{map}->{$rcpt} && !$quiet;
+
+    printf("Recipient added: %s\n",
+           join('@', $rcpt, $vdom->{name} ))
+        unless $vdom->{map}->{$rcpt} || $quiet;
+
+    # Add entry to the 'file', if not already present.
+    unless ($vdom->{map}->{$rcpt}) {
+        splice @{$vdom->{raw}}, $vdom->{insert}, 0, sprintf("[%s]", $rcpt);
+    }
+
+    # Update map entry
+    $vdom->{map}->{$rcpt} = $dest;
+}
+
+## Delete recipient from virtual domain.
+sub vdom_delete ($$) {
+    my $vdom = shift;
+    my $rcpt = shift;
+    my $domain = $vdom->{name};
+
+    abort "Recipient not found: $rcpt\@$domain\n"
+        unless $vdom->{map}->{$rcpt};
+    delete $vdom->{map}->{$rcpt};
+
+    printf("Recipient removed: %s\n",
+           join('@', $rcpt, $domain ))
+        unless $quiet;
+}
+
+## Dump/cat (vdom) file.
 sub	vdom_dump ($;$) {
     my $filename = shift;
     my $dirname = shift;
@@ -191,7 +243,7 @@ sub	vdom_dump ($;$) {
     while (<$fh>) { print; }; close($fh);
 }
 
-##
+## Read configuration file, eval defined conf variables.
 sub read_conf($) {
     my $filename = shift;
     return unless -f $filename;
