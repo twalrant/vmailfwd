@@ -43,7 +43,10 @@ $> addvmail -r sharon@example.net She no longer lives here.
 
 Todo
 
-* Add support to create virtual domain file
 * Add perldoc
 * Add command options for all configuration parameters
 * ...
+
+Done
+
+* Add support to create virtual domain file

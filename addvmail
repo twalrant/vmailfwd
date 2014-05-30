@@ -12,6 +12,7 @@ my $remove = 0;
 my $force = 0;
 my $fail = 0;
 my $quiet = 0;
+my $create = 0;
 my $blackhole = 0;
 my $domains_dir;
 my $domains_bckdir;
@@ -21,6 +22,7 @@ my $configfile = '/etc/default/vmailfwd';
 sub abort(@);
 sub vdom_read($;$);
 sub vdom_save($;$$);
+sub vdom_init($;$);
 sub vdom_delete($$);
 sub vdom_add($$$);
 sub emailparse($);
@@ -44,6 +46,7 @@ if ( basename($0) =~ /^del/ ) {
 } else {
     $remove = 0;
     GetOptions (
+        "i|create"	=>	\$create,
         "s|remove"	=>	\$remove,
         "r|reject"	=>	\$fail,
         "x|drop"	=>	\$blackhole,
@@ -62,7 +65,8 @@ print "Recipient:   local-part= $localpart_rcpt, domain= $domain_rcpt\n"
 
 ## Read recipient virtual domain file:
 my $vdom = vdom_read($domain_rcpt, $domains_dir);
-abort "Virtual domain not found: $domain_rcpt\n" unless $vdom;
+$vdom = vdom_init($domain_rcpt, $domains_dir) if $create && !$vdom;
+abort "Virtual domain not found $domain_rcpt: $!\n" unless $vdom;
 
 ## Delete entry:
 vdom_delete($vdom, $localpart_rcpt) if $remove;
@@ -72,7 +76,7 @@ vdom_add($vdom, $localpart_rcpt, $ARGV[1]) unless $remove;
 
 ## Save modified domain: 
 vdom_save($vdom, $domains_dir, $domains_bckdir) or
-    abort "Virtual domain not saved: $domain_rcpt\n";
+    abort "Virtual domain not saved $domain_rcpt: $!\n";
 
 ## Dump created file, if required.
 vdom_dump($domain_rcpt, $domains_dir) if $debug > 1;
@@ -97,6 +101,7 @@ EOF
 ;
     exit(0) if $progname =~ /^del/;
     print <<EOF
+   -i, --create       Create virtual domain file, if required.
    -f, --force        Force operation, replace existing recipient.
    -s, --remove       Suppress/remove existing recipient.
    -r, --reject       Reject/bounce recipient with <text> message.
@@ -119,8 +124,9 @@ sub emailparse ($) {
 
 ## Read Virtual Domain file.
 sub vdom_read ($;$) {
-    my $filename = shift;
+    my $domain = shift;
     my $dirname = shift;
+    my $filename = $domain;
     $filename = join('/', $dirname, $filename) if $dirname;
     return undef unless -f $filename;
     my @lines;
@@ -143,8 +149,18 @@ sub vdom_read ($;$) {
         }
     }
     close($fh);
-    return {name => $filename, raw => \@lines,
+    return {name => $domain, raw => \@lines,
             map => \%rcpts, insert => 1+$pos };
+}
+
+## Initialize Virtual Domain.
+sub vdom_init ($;$) {
+    my $domain = shift;
+    my $dirname = shift;
+    my @lines;
+    push @lines, "## Virtual domain file : $domain";
+    return {name => $domain, raw => \@lines,
+            map => {}, insert => 1 };
 }
 
 ## Save Virtual Domain to file.
@@ -154,9 +170,11 @@ sub	vdom_save($;$$) {
     my $dirbckp = shift;
     my $filename = $vdom->{name};
     $filename = join('/', $dirname, $filename) if $dirname;
-    return undef unless -f $filename;
-    move($filename, join('/', $dirbckp, join('.', $filename, 'bck')))
-         if $dirbckp;
+    if ($dirbckp && -f $filename) {
+        my $bckpname = join('/', $dirbckp, join('.', $vdom->{name}, 'bck'));
+        move($filename, $bckpname) ||
+            warn "Cannot create backup $bckpname: $!\n";
+    }
     open (my $fh, ">$filename") || return;
     foreach my $line ( @{$vdom->{raw}} ) {
         printf($fh "%s\n", $line) unless $line =~ /^\[/;
@@ -166,6 +184,7 @@ sub	vdom_save($;$$) {
         printf($fh "%s : %s\n", $rcpt[1], $vdom->{map}->{$rcpt[1]});
     }
     close($fh);
+    return $vdom;
 }
 
 ## Add or update recipient.
